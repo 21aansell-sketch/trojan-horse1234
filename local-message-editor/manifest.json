@@ -1,0 +1,15 @@
+{
+  "name": "Local Message Editor",
+  "description": "Locally edit messages from other users without changing the Discord server message.",
+  "authors": [
+    {
+      "name": "21aansell-sketch",
+      "id": "0"
+    }
+  ],
+  "main": "index.js",
+  "vendetta": {
+    "icon": "ic_edit_24px"
+  },
+  "hash": "e8edac6038749868678569830e1967e1e504f94d21bd562833b2cd24ae16abda"
+}
