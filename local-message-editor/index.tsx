@@ -15,43 +15,37 @@ type Message = {
     [key: string]: any;
 };
 
-const PLUGIN_NAME = "Local Message Editor";
+const MessageStore = findByStoreName("MessageStore");
+const UserStore = findByStoreName("UserStore");
 
-const LazyActionSheet = findByProps(
+const ActionSheet = findByProps(
     "openLazy",
     "hideActionSheet",
 );
 
-const MessageStore = findByStoreName("MessageStore");
-const UserStore = findByStoreName("UserStore");
-
-const Messages = findByProps(
-    "sendMessage",
+const MessageActions = findByProps(
     "startEditMessage",
     "editMessage",
 );
 
-const ActionSheetModule = findByProps("ActionSheetRow");
+const ActionSheetModule = findByProps(
+    "ActionSheetRow",
+);
 
 const ActionSheetRow =
     ActionSheetModule?.ActionSheetRow ??
     Forms.FormRow;
 
-const originalMessages = new Map<string, Message>();
+const savedMessages = new Map<string, Message>();
 
 let patches: (() => void)[] = [];
+let editingId: string | null = null;
 
-let editingMessageId: string | null = null;
-
-function cloneMessage(message: Message): Message {
+function clone(message: Message): Message {
     try {
-        return JSON.parse(
-            JSON.stringify(message),
-        );
+        return JSON.parse(JSON.stringify(message));
     } catch {
-        return {
-            ...message,
-        };
+        return { ...message };
     }
 }
 
@@ -70,28 +64,25 @@ function getMessage(message: Message): Message {
 
 function isOwnMessage(message: Message): boolean {
     try {
-        const currentUser =
-            UserStore?.getCurrentUser?.();
+        const user = UserStore?.getCurrentUser?.();
 
-        return (
-            !!currentUser?.id &&
-            !!message?.author?.id &&
-            currentUser.id === message.author.id
+        return Boolean(
+            user?.id &&
+            message?.author?.id &&
+            user.id === message.author.id,
         );
     } catch {
         return false;
     }
 }
 
-function addEditButton(
+function addButton(
     buttons: any[],
     message: Message,
 ) {
-    if (!buttons || !message?.id) {
-        return;
-    }
+    if (!Array.isArray(buttons)) return;
+    if (!message?.id) return;
 
-    // Don't add the button twice.
     if (
         buttons.some(
             (button) =>
@@ -102,47 +93,37 @@ function addEditButton(
         return;
     }
 
-    const currentMessage =
-        getMessage(message);
+    const current = getMessage(message);
 
-    // Don't add the button to our own messages.
-    if (isOwnMessage(currentMessage)) {
+    if (isOwnMessage(current)) {
         return;
     }
 
-    const handleEdit = () => {
+    const editLocally = () => {
         try {
-            editingMessageId =
-                currentMessage.id;
+            editingId = current.id;
 
-            // Save the original message.
-            if (
-                !originalMessages.has(
-                    currentMessage.id,
-                )
-            ) {
-                originalMessages.set(
-                    currentMessage.id,
-                    cloneMessage(currentMessage),
+            if (!savedMessages.has(current.id)) {
+                savedMessages.set(
+                    current.id,
+                    clone(current),
                 );
             }
 
-            // Close the action sheet.
-            LazyActionSheet?.hideActionSheet?.();
+            ActionSheet?.hideActionSheet?.();
 
-            // Open Discord's normal message editor.
-            Messages?.startEditMessage?.(
-                currentMessage.channel_id,
-                currentMessage.id,
-                currentMessage.content ?? "",
+            MessageActions?.startEditMessage?.(
+                current.channel_id,
+                current.id,
+                current.content ?? "",
             );
         } catch (error) {
             console.error(
-                `[${PLUGIN_NAME}] Failed to start edit:`,
+                "[Local Message Editor] Failed to start edit:",
                 error,
             );
 
-            editingMessageId = null;
+            editingId = null;
         }
     };
 
@@ -162,61 +143,41 @@ function addEditButton(
         icon = undefined;
     }
 
-    const button = (
+    const row = (
         <ActionSheetRow
             label="Edit Locally"
             icon={icon}
-            onPress={handleEdit}
+            onPress={editLocally}
         />
     );
 
-    // Put the button near the other message actions.
-    const unreadIndex =
-        buttons.findIndex(
-            (button) =>
-                button?.props?.message
-                    ?.toString?.() ===
-                "MARK_UNREAD",
-        );
-
-    const position =
-        unreadIndex >= 0
-            ? unreadIndex
-            : 0;
-
-    buttons.splice(
-        position,
-        0,
-        button,
-    );
+    buttons.unshift(row);
 }
 
 export default {
     onLoad() {
-        console.log(
-            `[${PLUGIN_NAME}] Loading...`,
-        );
-
-        // Check required modules.
-        if (!LazyActionSheet) {
+        if (!ActionSheet) {
             console.error(
-                `[${PLUGIN_NAME}] Action sheet module not found.`,
+                "[Local Message Editor] ActionSheet not found.",
             );
             return;
         }
 
-        if (!Messages) {
+        if (!MessageActions?.editMessage) {
             console.error(
-                `[${PLUGIN_NAME}] Message module not found.`,
+                "[Local Message Editor] Message actions not found.",
             );
             return;
         }
 
-        // Message long-press menu.
+        /*
+         * Add "Edit Locally" to the message
+         * long-press menu.
+         */
         patches.push(
             before(
                 "openLazy",
-                LazyActionSheet,
+                ActionSheet,
                 ([component, key, data]) => {
                     if (
                         key !==
@@ -234,189 +195,163 @@ export default {
 
                     component?.then?.(
                         (instance: any) => {
-                            if (!instance) {
-                                return;
-                            }
+                            if (!instance) return;
 
-                            const unpatch =
-                                after(
-                                    "default",
-                                    instance,
-                                    (
-                                        _args,
-                                        result,
-                                    ) => {
-                                        // Remove the temporary patch.
-                                        setTimeout(
-                                            () => {
-                                                try {
-                                                    unpatch();
-                                                } catch {}
-                                            },
-                                            0,
+                            const unpatch = after(
+                                "default",
+                                instance,
+                                (_args: any, result: any) => {
+                                    setTimeout(
+                                        () => {
+                                            try {
+                                                unpatch();
+                                            } catch {}
+                                        },
+                                        0,
+                                    );
+
+                                    const buttons =
+                                        findInReactTree(
+                                            result,
+                                            (node: any) =>
+                                                Array.isArray(
+                                                    node,
+                                                ) &&
+                                                node.some?.(
+                                                    (
+                                                        item: any,
+                                                    ) =>
+                                                        item
+                                                            ?.type
+                                                            ?.name ===
+                                                        "ActionSheetRow",
+                                                ),
                                         );
 
-                                        // Find the action-sheet buttons.
-                                        const buttons =
-                                            findInReactTree(
-                                                result,
-                                                (
-                                                    node: any,
-                                                ) =>
-                                                    Array.isArray(
-                                                        node,
-                                                    ) &&
-                                                    node.some?.(
-                                                        (
-                                                            item: any,
-                                                        ) =>
-                                                            item
-                                                                ?.type
-                                                                ?.name ===
-                                                            "ActionSheetRow",
-                                                    ),
-                                            );
+                                    if (!buttons) {
+                                        return;
+                                    }
 
-                                        if (
-                                            !buttons
-                                        ) {
-                                            return;
-                                        }
-
-                                        addEditButton(
-                                            buttons,
-                                            message,
-                                        );
-                                    },
-                                );
+                                    addButton(
+                                        buttons,
+                                        message,
+                                    );
+                                },
+                            );
                         },
                     );
                 },
             ),
         );
 
-        // Intercept editMessage.
+        /*
+         * Intercept the edit request.
+         *
+         * The edited content is sent to the
+         * local Flux store instead of Discord.
+         */
         patches.push(
             before(
                 "editMessage",
-                Messages,
+                MessageActions,
                 (args: any[]) => {
                     const [
                         channelId,
                         messageId,
-                        newMessage,
+                        data,
                     ] = args;
 
-                    // Ignore normal Discord edits.
                     if (
-                        !editingMessageId ||
-                        messageId !==
-                            editingMessageId
+                        !editingId ||
+                        messageId !== editingId
                     ) {
                         return;
                     }
 
                     const original =
-                        originalMessages.get(
+                        savedMessages.get(
                             messageId,
                         );
 
                     if (!original) {
-                        editingMessageId =
-                            null;
+                        editingId = null;
                         return;
                     }
 
                     const content =
-                        typeof newMessage ===
-                        "string"
-                            ? newMessage
-                            : newMessage
-                                  ?.content ??
-                              "";
+                        typeof data === "string"
+                            ? data
+                            : data?.content ?? "";
 
                     try {
-                        // Update only the local message store.
                         FluxDispatcher.dispatch({
-                            type:
-                                "MESSAGE_UPDATE",
+                            type: "MESSAGE_UPDATE",
 
                             message: {
                                 ...original,
                                 channel_id:
                                     channelId,
                                 content,
-
-                                // Don't show the normal edited marker.
                                 edited_timestamp:
                                     null,
                             },
 
-                            // Prevent other plugins from treating
-                            // this as a normal Discord edit.
                             otherPluginBypass:
                                 true,
                         });
 
-                        // Prevent Discord from sending the edit.
+                        /*
+                         * Stop the real Discord
+                         * edit from being sent.
+                         */
                         return false;
                     } catch (error) {
                         console.error(
-                            `[${PLUGIN_NAME}] Failed to apply local edit:`,
+                            "[Local Message Editor] Failed to update message:",
                             error,
                         );
 
-                        editingMessageId =
-                            null;
+                        editingId = null;
                     }
                 },
             ),
         );
 
-        // Reset editing state when editing ends.
+        /*
+         * Reset editing state when the editor closes.
+         */
         if (
-            Messages?.endEditMessage
+            MessageActions?.endEditMessage
         ) {
             patches.push(
                 after(
                     "endEditMessage",
-                    Messages,
+                    MessageActions,
                     () => {
-                        editingMessageId =
-                            null;
+                        editingId = null;
                     },
                 ),
             );
         }
 
         console.log(
-            `[${PLUGIN_NAME}] Loaded successfully.`,
+            "[Local Message Editor] Loaded.",
         );
     },
 
     onUnload() {
-        console.log(
-            `[${PLUGIN_NAME}] Unloading...`,
-        );
-
-        // Remove all patches.
-        for (
-            const unpatch of patches
-        ) {
+        for (const unpatch of patches) {
             try {
                 unpatch();
             } catch {}
         }
 
         patches = [];
-
-        // Clear local state.
-        originalMessages.clear();
-
-        editingMessageId = null;
+        savedMessages.clear();
+        editingId = null;
 
         console.log(
-            `[${PLUGIN_NAME}] Unloaded.`,
+            "[Local Message Editor] Unloaded.",
         );
     },
 };
