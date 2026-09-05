@@ -1,7 +1,3 @@
-Sure — here is the complete index.tsx code for Step 3. Copy everything inside the code block into:
-
-local-message-editor/index.tsx
-
 import { findByProps, findByStoreName } from "@vendetta/metro";
 import { FluxDispatcher } from "@vendetta/metro/common";
 import { before, after } from "@vendetta/patcher";
