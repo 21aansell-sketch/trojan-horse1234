@@ -1,224 +1,556 @@
-(function () {
+(() => {
     "use strict";
 
+    const vendettaApi = globalThis.vendetta;
     const React = globalThis.React;
-    const metro = vendetta.metro;
-    const { before, after } = vendetta.patcher;
-    const { getAssetIDByName } = vendetta.ui.assets;
-    const { Forms } = vendetta.ui.components;
 
-    const MessageStore = metro.findByStoreName("MessageStore");
-    const UserStore = metro.findByStoreName("UserStore");
-    const ActionSheet = metro.findByProps("openLazy", "hideActionSheet");
-    const ActionSheetModule = metro.findByProps("ActionSheetRow") || {};
-    const ActionSheetRow = ActionSheetModule.ActionSheetRow || Forms?.FormRow;
-    const MessageActions = metro.findByProps("startEditMessage", "editMessage");
+    if (!vendettaApi || !React) {
+        console.error("[Local Message Editor] Kettu/Vendetta runtime not available.");
+        return {
+            onLoad() {},
+            onUnload() {},
+        };
+    }
 
-    const savedMessages = new Map();
-    let patches = [];
-    let editingId = null;
+    const metro = vendettaApi.metro;
+    const patcher = vendettaApi.patcher;
+    const assets = vendettaApi.ui?.assets;
+    const components = vendettaApi.ui?.components;
 
-    function clone(message) {
-        try { return JSON.parse(JSON.stringify(message)); }
-        catch { return { ...message }; }
+    const { before, after } = patcher || {};
+    const { getAssetIDByName } = assets || {};
+    const Forms = components?.Forms;
+
+    const patches = [];
+    const localEdits = new Map();
+    let editingMessageId = null;
+
+    function findByStoreName(name) {
+        try {
+            return metro?.findByStoreName?.(name);
+        } catch {
+            return undefined;
+        }
+    }
+
+    function findByProps(...props) {
+        try {
+            return metro?.findByProps?.(...props);
+        } catch {
+            return undefined;
+        }
+    }
+
+    function findStore(name, ...fallbackProps) {
+        return findByStoreName(name) || findByProps(...fallbackProps);
+    }
+
+    const MessageStore = findStore("MessageStore", "getMessage", "getMessages");
+    const UserStore = findStore("UserStore", "getCurrentUser", "getUser");
+
+    const ActionSheet =
+        findByProps("openLazy", "hideActionSheet") ||
+        findByProps("openLazy");
+
+    const ActionSheetModule =
+        findByProps("ActionSheetRow") || {};
+
+    const ActionSheetRow =
+        ActionSheetModule.ActionSheetRow ||
+        Forms?.FormRow;
+
+    // Prefer the exact pair used by the Discord edit flow, but tolerate
+    // changes in the surrounding module export shape.
+    const MessageActions =
+        findByProps("startEditMessage", "editMessage") ||
+        findByProps("startEditMessage") ||
+        findByProps("editMessage");
+
+    function safeClone(value) {
+        try {
+            return JSON.parse(JSON.stringify(value));
+        } catch {
+            return value && typeof value === "object" ? { ...value } : value;
+        }
     }
 
     function getMessage(message) {
-        try { return MessageStore?.getMessage(message.channel_id, message.id) ?? message; }
-        catch { return message; }
+        if (!message?.channel_id || !message?.id) return message;
+
+        try {
+            return MessageStore?.getMessage?.(
+                message.channel_id,
+                message.id
+            ) ?? message;
+        } catch {
+            return message;
+        }
     }
 
     function isOwnMessage(message) {
         try {
             const user = UserStore?.getCurrentUser?.();
-            return !!(user?.id && message?.author?.id && user.id === message.author.id);
-        } catch { return false; }
+            return Boolean(
+                user?.id &&
+                message?.author?.id &&
+                String(user.id) === String(message.author.id)
+            );
+        } catch {
+            return false;
+        }
     }
 
-    function typeName(node) {
-        const t = node?.type;
-        return String(t?.displayName || t?.name || t?.type?.displayName || t?.type?.name || "");
+    function getTypeName(node) {
+        const type = node?.type;
+        return String(
+            type?.displayName ||
+            type?.name ||
+            type?.type?.displayName ||
+            type?.type?.name ||
+            ""
+        );
     }
 
-    function isRowElement(node) {
-        if (!React?.isValidElement?.(node)) return false;
-        const name = typeName(node).toLowerCase();
-        const p = node.props || {};
-        return name.includes("actionsheetrow") || name.includes("formrow") ||
-            (name.includes("row") && (typeof p.onPress === "function" || typeof p.label === "string" || typeof p.title === "string"));
+    function isActionRow(node) {
+        if (!React.isValidElement?.(node)) return false;
+
+        const name = getTypeName(node).toLowerCase();
+        const props = node.props || {};
+
+        return (
+            name.includes("actionsheetrow") ||
+            name.includes("formrow") ||
+            (
+                name.includes("row") &&
+                (
+                    typeof props.onPress === "function" ||
+                    typeof props.label === "string" ||
+                    typeof props.title === "string"
+                )
+            )
+        );
     }
 
     function findRowArray(node, depth = 0, seen = new Set()) {
-        if (depth > 25 || node == null) return null;
-        if (typeof node === "object" && node !== null) {
+        if (node == null || depth > 30) return null;
+
+        if (typeof node === "object") {
             if (seen.has(node)) return null;
             seen.add(node);
         }
 
         if (Array.isArray(node)) {
-            const rows = node.filter(isRowElement);
-            if (rows.length >= 2) return node;
-            for (const child of node) {
-                const found = findRowArray(child, depth + 1, seen);
-                if (found) return found;
+            if (node.filter(isActionRow).length >= 2) {
+                return node;
             }
+
+            for (const child of node) {
+                const result = findRowArray(child, depth + 1, seen);
+                if (result) return result;
+            }
+
             return null;
         }
 
-        if (React?.isValidElement?.(node)) {
-            const found = findRowArray(node.props?.children, depth + 1, seen);
-            if (found) return found;
+        if (React.isValidElement?.(node)) {
+            return findRowArray(node.props?.children, depth + 1, seen);
         }
 
         if (typeof node === "object") {
             if (node.props) {
-                const found = findRowArray(node.props.children, depth + 1, seen);
-                if (found) return found;
+                const result = findRowArray(
+                    node.props.children,
+                    depth + 1,
+                    seen
+                );
+                if (result) return result;
             }
+
             for (const key of Object.keys(node)) {
                 if (key === "_owner" || key === "_store") continue;
-                const found = findRowArray(node[key], depth + 1, seen);
-                if (found) return found;
+
+                const result = findRowArray(
+                    node[key],
+                    depth + 1,
+                    seen
+                );
+
+                if (result) return result;
             }
         }
+
         return null;
     }
 
     function extractMessage(data) {
-        return data?.message || data?.targetMessage || data?.msg || data?.item?.message ||
-            (data?.channel_id && data?.id ? data : null);
+        return (
+            data?.message ||
+            data?.targetMessage ||
+            data?.msg ||
+            data?.item?.message ||
+            (data?.channel_id && data?.id ? data : null)
+        );
     }
 
-    function makeEditHandler(current) {
+    function setRowLabel(props, label) {
+        if ("label" in props) props.label = label;
+        else if ("title" in props) props.title = label;
+        else if ("text" in props) props.text = label;
+        else props.label = label;
+    }
+
+    function makeEditHandler(message) {
         return () => {
             try {
-                editingId = current.id;
-                if (!savedMessages.has(current.id)) savedMessages.set(current.id, clone(current));
+                const current = getMessage(message);
+
+                if (!current?.id || !current?.channel_id) return;
+
+                editingMessageId = current.id;
+
+                if (!localEdits.has(current.id)) {
+                    localEdits.set(current.id, safeClone(current));
+                }
+
                 ActionSheet?.hideActionSheet?.();
-                MessageActions?.startEditMessage?.(current.channel_id, current.id, current.content ?? "");
-            } catch (e) {
-                console.error("[Local Message Editor] Failed to start edit:", e);
-                editingId = null;
+
+                const startEdit = MessageActions?.startEditMessage;
+                if (typeof startEdit !== "function") {
+                    throw new Error("startEditMessage was not found");
+                }
+
+                startEdit(
+                    current.channel_id,
+                    current.id,
+                    current.content ?? ""
+                );
+            } catch (error) {
+                console.error(
+                    "[Local Message Editor] Could not start local edit:",
+                    error
+                );
+                editingMessageId = null;
             }
         };
     }
 
-    function addButton(result, message) {
+    function addEditLocallyButton(result, message) {
         const current = getMessage(message);
-        if (!current?.id || !current?.channel_id || isOwnMessage(current)) return false;
 
-        const buttons = findRowArray(result);
-        if (!buttons) {
-            console.warn("[Local Message Editor] v3: no row array found in message action sheet");
+        if (
+            !current?.id ||
+            !current?.channel_id ||
+            isOwnMessage(current)
+        ) {
             return false;
         }
 
-        if (buttons.some((button) => {
-            const p = button?.props || {};
-            return String(p.label ?? p.title ?? p.text ?? "") === "Edit Locally";
-        })) return true;
+        const rows = findRowArray(result);
 
-        const template = buttons.find(isRowElement);
-        if (!template && !ActionSheetRow) return false;
+        if (!rows) {
+            console.warn(
+                "[Local Message Editor] Could not locate message action rows."
+            );
+            return false;
+        }
 
-        const editLocally = makeEditHandler(current);
+        if (
+            rows.some((row) => {
+                const props = row?.props || {};
+                const label =
+                    props.label ??
+                    props.title ??
+                    props.text ??
+                    "";
+
+                return String(label) === "Edit Locally";
+            })
+        ) {
+            return true;
+        }
+
+        const template = rows.find(isActionRow);
+
+        if (!template && !ActionSheetRow) {
+            console.warn(
+                "[Local Message Editor] ActionSheetRow/FormRow not found."
+            );
+            return false;
+        }
+
+        const onPress = makeEditHandler(current);
         let row;
 
         try {
             if (template) {
-                const p = { ...(template.props || {}) };
-                if ("label" in p) p.label = "Edit Locally";
-                else if ("title" in p) p.title = "Edit Locally";
-                else if ("text" in p) p.text = "Edit Locally";
-                else p.label = "Edit Locally";
-                p.onPress = editLocally;
-                try { p.icon = getAssetIDByName("ic_edit_24px"); } catch {}
-                row = React.cloneElement(template, p);
+                const props = { ...(template.props || {}) };
+
+                setRowLabel(props, "Edit Locally");
+                props.onPress = onPress;
+
+                if (typeof getAssetIDByName === "function") {
+                    try {
+                        props.icon = getAssetIDByName("ic_edit_24px");
+                    } catch {}
+                }
+
+                row = React.cloneElement(template, props);
             } else {
-                const props = { label: "Edit Locally", onPress: editLocally };
-                try { props.icon = getAssetIDByName("ic_edit_24px"); } catch {}
+                const props = {
+                    label: "Edit Locally",
+                    onPress,
+                };
+
+                if (typeof getAssetIDByName === "function") {
+                    try {
+                        props.icon = getAssetIDByName("ic_edit_24px");
+                    } catch {}
+                }
+
                 row = React.createElement(ActionSheetRow, props);
             }
-            buttons.unshift(row);
-            console.log("[Local Message Editor] v3: inserted Edit Locally");
+
+            rows.unshift(row);
             return true;
-        } catch (e) {
-            console.error("[Local Message Editor] v3: failed to insert row", e);
+        } catch (error) {
+            console.error(
+                "[Local Message Editor] Failed to add menu item:",
+                error
+            );
             return false;
         }
     }
 
-    return {
-        onLoad() {
-            if (!ActionSheet || !MessageActions?.editMessage) {
-                console.error("[Local Message Editor] Required Discord modules not found.", {
-                    ActionSheet: !!ActionSheet,
-                    MessageActions: !!MessageActions,
-                });
-                return;
-            }
+    function patchActionSheet() {
+        if (
+            typeof before !== "function" ||
+            !ActionSheet ||
+            typeof ActionSheet.openLazy !== "function"
+        ) {
+            console.error(
+                "[Local Message Editor] ActionSheet.openLazy is unavailable."
+            );
+            return;
+        }
 
-            patches.push(before("openLazy", ActionSheet, ([component, key, data]) => {
+        const unpatch = before(
+            "openLazy",
+            ActionSheet,
+            ([component, key, data]) => {
                 const message = extractMessage(data);
-                const componentName = String(component?.displayName || component?.name || component?.default?.displayName || component?.default?.name || "");
-                const isMessageSheet = key === "MessageLongPressActionSheet" ||
-                    /message.*long.*press|long.*press.*message/i.test(componentName) || !!message;
-                if (!isMessageSheet || !message?.id) return;
 
-                const hook = (instance) => {
-                    if (!instance) return;
-                    const target = instance.default ? instance : { default: instance };
+                if (!message?.id || !message?.channel_id) return;
+
+                const componentName = String(
+                    component?.displayName ||
+                    component?.name ||
+                    component?.default?.displayName ||
+                    component?.default?.name ||
+                    ""
+                );
+
+                const isMessageSheet =
+                    key === "MessageLongPressActionSheet" ||
+                    /message.*long.*press|long.*press.*message/i.test(
+                        componentName
+                    ) ||
+                    Boolean(message);
+
+                if (!isMessageSheet) return;
+
+                const hook = (loadedComponent) => {
+                    if (!loadedComponent) return;
+
+                    const target =
+                        loadedComponent.default
+                            ? loadedComponent
+                            : { default: loadedComponent };
+
                     if (typeof target.default !== "function") return;
 
-                    const unpatch = after("default", target, (_args, result) => {
-                        try { addButton(result, message); }
-                        catch (e) { console.error("[Local Message Editor] v3 menu patch failed:", e); }
-                        setTimeout(() => { try { unpatch(); } catch {} }, 0);
-                    });
+                    let menuUnpatch;
+
+                    try {
+                        menuUnpatch = after(
+                            "default",
+                            target,
+                            (_args, result) => {
+                                try {
+                                    addEditLocallyButton(result, message);
+                                } catch (error) {
+                                    console.error(
+                                        "[Local Message Editor] Action-sheet patch failed:",
+                                        error
+                                    );
+                                }
+
+                                queueMicrotask(() => {
+                                    try {
+                                        menuUnpatch?.();
+                                    } catch {}
+                                });
+                            }
+                        );
+                    } catch (error) {
+                        console.error(
+                            "[Local Message Editor] Could not patch action-sheet component:",
+                            error
+                        );
+                    }
                 };
 
                 try {
-                    if (component?.then) component.then(hook);
-                    else hook(component);
-                } catch (e) {
-                    console.error("[Local Message Editor] v3 failed to hook action sheet:", e);
+                    if (component?.then) {
+                        component.then(hook);
+                    } else {
+                        hook(component);
+                    }
+                } catch (error) {
+                    console.error(
+                        "[Local Message Editor] Could not load action-sheet component:",
+                        error
+                    );
                 }
-            }));
+            }
+        );
 
-            patches.push(before("editMessage", MessageActions, (args) => {
+        patches.push(unpatch);
+    }
+
+    function patchEditAction() {
+        if (
+            typeof before !== "function" ||
+            !MessageActions ||
+            typeof MessageActions.editMessage !== "function"
+        ) {
+            console.error(
+                "[Local Message Editor] MessageActions.editMessage is unavailable."
+            );
+            return;
+        }
+
+        const unpatch = before(
+            "editMessage",
+            MessageActions,
+            (args) => {
                 const [channelId, messageId, data] = args;
-                if (!editingId || messageId !== editingId) return;
-                const original = savedMessages.get(messageId);
-                if (!original) { editingId = null; return; }
-                const content = typeof data === "string" ? data : data?.content ?? "";
+
+                if (
+                    !editingMessageId ||
+                    String(messageId) !== String(editingMessageId)
+                ) {
+                    return;
+                }
+
+                const original = localEdits.get(messageId);
+
+                if (!original) {
+                    editingMessageId = null;
+                    return;
+                }
+
+                const content =
+                    typeof data === "string"
+                        ? data
+                        : data?.content ?? "";
+
                 try {
-                    metro.common.FluxDispatcher.dispatch({
+                    const dispatcher =
+                        metro?.common?.FluxDispatcher;
+
+                    if (!dispatcher?.dispatch) {
+                        throw new Error(
+                            "FluxDispatcher.dispatch was not found"
+                        );
+                    }
+
+                    dispatcher.dispatch({
                         type: "MESSAGE_UPDATE",
-                        message: { ...original, channel_id: channelId, content, edited_timestamp: null },
+                        message: {
+                            ...original,
+                            channel_id: channelId,
+                            content,
+                            edited_timestamp: null,
+                        },
                         otherPluginBypass: true,
                     });
-                    return false;
-                } catch (e) {
-                    console.error("[Local Message Editor] Failed to update message:", e);
-                    editingId = null;
-                }
-            }));
 
-            if (MessageActions?.endEditMessage) {
-                patches.push(after("endEditMessage", MessageActions, () => { editingId = null; }));
+                    // Returning false prevents Discord's real edit request.
+                    return false;
+                } catch (error) {
+                    console.error(
+                        "[Local Message Editor] Local message update failed:",
+                        error
+                    );
+                    editingMessageId = null;
+                }
+            }
+        );
+
+        patches.push(unpatch);
+    }
+
+    function patchEndEdit() {
+        if (
+            typeof after !== "function" ||
+            !MessageActions ||
+            typeof MessageActions.endEditMessage !== "function"
+        ) {
+            return;
+        }
+
+        const unpatch = after(
+            "endEditMessage",
+            MessageActions,
+            () => {
+                editingMessageId = null;
+            }
+        );
+
+        patches.push(unpatch);
+    }
+
+    return {
+        onLoad() {
+            console.log("[Local Message Editor] Loading...");
+
+            if (!MessageActions) {
+                console.error(
+                    "[Local Message Editor] MessageActions module was not found."
+                );
+                return;
             }
 
-            console.log("[Local Message Editor] Loaded v3", {
-                actionSheet: !!ActionSheet,
-                actionSheetRow: !!ActionSheetRow,
-                messageActions: !!MessageActions,
+            patchActionSheet();
+            patchEditAction();
+            patchEndEdit();
+
+            console.log("[Local Message Editor] Loaded.", {
+                messageStore: Boolean(MessageStore),
+                userStore: Boolean(UserStore),
+                actionSheet: Boolean(ActionSheet),
+                actionSheetRow: Boolean(ActionSheetRow),
+                messageActions: Boolean(MessageActions),
+                startEditMessage:
+                    typeof MessageActions.startEditMessage === "function",
+                editMessage:
+                    typeof MessageActions.editMessage === "function",
+                endEditMessage:
+                    typeof MessageActions.endEditMessage === "function",
             });
         },
+
         onUnload() {
-            for (const unpatch of patches) { try { unpatch(); } catch {} }
-            patches = [];
-            savedMessages.clear();
-            editingId = null;
+            for (const unpatch of patches.splice(0)) {
+                try {
+                    unpatch?.();
+                } catch {}
+            }
+
+            localEdits.clear();
+            editingMessageId = null;
+
+            console.log("[Local Message Editor] Unloaded.");
         },
     };
 })()
